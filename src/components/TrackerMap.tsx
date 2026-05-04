@@ -166,7 +166,7 @@ export default function TrackerMap() {
     );
   }
 
-  const center = location ? { lat: location.lat, lng: location.lng } : { lat: 1.3521, lng: 103.8198 };
+  const center = location ? { lat: location.lat, lng: location.lng } : { lat: 14.6401, lng: 121.0773 };
 
   const lastSeen = location
     ? new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).format(
