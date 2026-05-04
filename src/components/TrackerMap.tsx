@@ -96,7 +96,7 @@ export default function TrackerMap() {
   const fetchDevices = useCallback(async () => {
     try {
       const res = await fetch('/api/devices');
-      const data = await res.json();
+      const data = (await res.json()) as { devices: string[] };
       setDevices(data.devices ?? []);
       if (data.devices?.length && !selectedDevice) {
         setSelectedDevice(data.devices[0]);
@@ -114,7 +114,7 @@ export default function TrackerMap() {
         setError('Device not found or offline');
         return;
       }
-      const data = await res.json();
+      const data = (await res.json()) as LocationRecord;
       setLocation(data);
       setError(null);
     } catch {
@@ -126,7 +126,7 @@ export default function TrackerMap() {
     setLoadingHistory(true);
     try {
       const res = await fetch(`/api/history/${encodeURIComponent(deviceId)}`);
-      const data = await res.json();
+      const data = (await res.json()) as { trail: TrailPoint[] };
       setTrail(data.trail ?? []);
     } finally {
       setLoadingHistory(false);
