@@ -114,9 +114,11 @@
 #define SMS_ONLY_AS_FALLBACK 0
 
 // ── SIM balance (carrier-specific USSD) ────────────────────
-// Smart : *214#     Globe : *143#     DITO : *888#
+// Smart's *214# returns +CUSD: 2 (rejected) on some prepaid plans —
+// *123# launches the main menu and on most Smart accounts replies
+// with the balance as the first line of the menu prompt.
 // Result text gets POSTed to BALANCE_URL when WiFi is up.
-#define BALANCE_USSD    "*214#"
+#define BALANCE_USSD    "*123#"
 #define BALANCE_URL     "https://navio.cjuy.dev/api/balance"
 
 
@@ -432,19 +434,72 @@ bool sendSMS(const char* number, const String& message) {
 // Module reply pattern:
 //   OK
 //   +CUSD: 0,"Your balance is P 47.00...",15
+// Poll the SIM serial port until a complete +CUSD URC has arrived
+// (i.e. we've seen `+CUSD:` followed by a fully-closed quoted body
+// and then a brief drain), OR the hard timeout expires.
+//
+// USSD is two-phase: the module ACKs with "OK" instantly, then the
+// real reply trickles in seconds later from the network. The simple
+// idle-timeout collector exits after the OK and misses the URC, so
+// we need this token-aware waiter for USSD specifically.
+String simWaitForCUSD(unsigned long timeoutMs) {
+  String buf;
+  unsigned long deadline = millis() + timeoutMs;
+  bool sawCusd = false;
+  int  cusdAt  = -1;
+  unsigned long quietSince = 0;
+
+  while (millis() < deadline) {
+    while (simSerial.available()) {
+      buf += (char)simSerial.read();
+      quietSince = millis();
+    }
+
+    // Look for the URC. We anchor on "+CUSD:" specifically — the
+    // echoed command line uses "+CUSD=" (equals sign), so this won't
+    // false-match the echo.
+    if (!sawCusd) {
+      cusdAt = buf.indexOf("+CUSD:");
+      if (cusdAt >= 0) sawCusd = true;
+    }
+
+    // Once seen, look for the fully-quoted body and a small drain
+    // window so we get any trailing ",15\r\n".
+    if (sawCusd) {
+      int q1 = buf.indexOf('"', cusdAt);
+      int q2 = (q1 >= 0) ? buf.indexOf('"', q1 + 1) : -1;
+      if (q1 >= 0 && q2 > q1 && quietSince > 0
+          && (millis() - quietSince) > 150) {
+        return buf;
+      }
+    }
+
+    delay(20);
+  }
+  return buf;   // timed out — caller will see no +CUSD in result
+}
+
 bool simQueryBalance(String& out) {
   if (!simReady) return false;
 
-  // Some firmwares need CUSD enabled first. Idempotent — safe to spam.
-  simSerial.println("AT+CUSD=1");
-  simCollect(1500);
+  // Drain any stale data from prior commands so it doesn't pollute
+  // our search for the +CUSD URC below.
+  while (simSerial.available()) simSerial.read();
 
+  // Enable USSD result codes. Some firmwares default to disabled.
+  // Idempotent — safe to call every time.
+  simSerial.println("AT+CUSD=1");
+  simCollect(1000);
+  while (simSerial.available()) simSerial.read();   // drain again
+
+  // Fire the actual query. ",15" = GSM 7-bit alphabet for the reply.
   simSerial.print("AT+CUSD=1,\"");
   simSerial.print(BALANCE_USSD);
   simSerial.println("\",15");
 
-  // USSD round-trip varies wildly by carrier. 20 s is generous.
-  String r = simCollect(20000);
+  // USSD round-trip can take 3–15 s on Smart. Wait for the URC,
+  // not just for idle.
+  String r = simWaitForCUSD(25000);
   Serial.printf("[USSD] raw: [%s]\n", r.c_str());
 
   int idx = r.indexOf("+CUSD:");
@@ -453,9 +508,21 @@ bool simQueryBalance(String& out) {
   int q2 = r.indexOf('"', q1 + 1);
   if (q1 < 0 || q2 <= q1) return false;
 
-  out = r.substring(q1 + 1, q2);
-  out.trim();
-  return out.length() > 0;
+  String reply = r.substring(q1 + 1, q2);
+  reply.trim();
+
+  // Some firmware/carrier combos return a placeholder echoing the
+  // dial code (e.g. "*214#") before the real reply, then send a
+  // second URC. If that's all we got, treat as failure so the loop
+  // retries — better to retry than to display garbage on the site.
+  if (reply.length() == 0) return false;
+  if (reply == BALANCE_USSD) {
+    Serial.println("[USSD] got dial-code echo, not real reply — treating as failure");
+    return false;
+  }
+
+  out = reply;
+  return true;
 }
 
 // POST balance text to /api/balance. Server stores latest value
