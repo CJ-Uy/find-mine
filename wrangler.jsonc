@@ -8,7 +8,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "navio",
+	"name": "find-mine",
 	"account_id": "8527ec1369d46f55304a6f59ab5356e4",
 	"main": ".open-next/worker.js",
 	"compatibility_date": "2026-05-04",
@@ -40,7 +40,7 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "navio",
+			"database_name": "find-mine",
 			"database_id": "debfa01b-6d8a-4233-aa66-3af1c096c6bf"
 		}
 	]

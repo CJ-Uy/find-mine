@@ -1,7 +1,7 @@
 /*
  * ============================================================
  *  Navio GPS Tracker
- *  Hardware: ESP32 + GY-GPS6MV2 (NEO-6M)
+ *  Hardware: ESP32 + GY-GPS6MV2 (NEO-6M) + SIM800L (SMS fallback)
  * ============================================================
  *
  *  WIRING
@@ -10,6 +10,13 @@
  *  GPS GND  → ESP32 GND
  *  GPS TX   → ESP32 GPIO 16  (ESP32 RX2)
  *  GPS RX   → ESP32 GPIO 17  (ESP32 TX2)  ← not strictly needed (read-only)
+ *
+ *  SIM800L VCC → 4.0V supply (NOT ESP32 3.3V — needs ~2A burst on TX,
+ *                will brown out the ESP32). Use a separate buck or LiPo.
+ *  SIM800L GND → ESP32 GND   (common ground required)
+ *  SIM800L TXD → ESP32 GPIO 5   (ESP32 RX1)
+ *  SIM800L RXD → ESP32 GPIO 4   (ESP32 TX1)  — level-shift to 2.8V if strict;
+ *                                              5V-tolerant in practice on most boards.
  *
  *  LIBRARIES  (install via Arduino Library Manager)
  *  ─────────────────────────────────────────────────
@@ -24,7 +31,7 @@
  *  ────────────
  *  1. On boot, loads saved WiFi credentials from flash (Preferences).
  *  2a. If credentials exist and connect OK → STA mode.
- *      Posts GPS data to your server every UPLOAD_INTERVAL_MS.
+ *      Posts GPS data to your server every UPLOAD_INTERVAL_MS (HTTP).
  *      http://navio.local still works — visit it to switch networks.
  *  2b. If no credentials / connection fails → AP mode.
  *      Creates WiFi hotspot "Navio" (password: "password").
@@ -32,6 +39,12 @@
  *      Saves credentials and reboots into STA mode.
  *  3. If WiFi drops in STA mode, tries to reconnect MAX_RECONNECT_TRIES
  *     times, then falls back to AP mode so you can reconfigure.
+ *  4. SMS PATH (always-on, runs in parallel with HTTP):
+ *      Every SMS_INTERVAL_MS the device sends one SMS to PHONE_NUMBER
+ *      with payload "NAVIO|<device_id>|<lat>|<lng>|<speed>|<sats>".
+ *      The receiving phone number is a Twilio (or Semaphore) inbound
+ *      number that webhooks the message into /api/sms on your server.
+ *      SMS keeps working even with no WiFi — it's the offline fallback.
  *
  *  LED SIGNALS  (built-in blue LED, GPIO 2)
  *  ─────────────────────────────────────────
@@ -53,9 +66,26 @@
 #include <ArduinoJson.h>
 
 // ── Pin / UART config ──────────────────────────────────────
-#define GPS_RX_PIN      16        // ESP32 RX2 ← GPS TX
-#define GPS_TX_PIN      17        // ESP32 TX2 → GPS RX
+#define GPS_RX_PIN      16        // ESP32 RX2 ← GPS TX  (UART2)
+#define GPS_TX_PIN      17        // ESP32 TX2 → GPS RX  (UART2)
 #define GPS_BAUD        9600
+
+// ── SIM800L (SMS) ──────────────────────────────────────────
+// UART1 — kept separate from GPS UART2 so both run at the same time.
+// ESP32 HardwareSerial.begin(baud, cfg, rxPin, txPin) — note the order:
+// rx first, tx second. Wire SIM TX → ESP32 RX, SIM RX → ESP32 TX.
+#define SIM_RX_PIN      5         // ESP32 RX1 ← SIM TXD
+#define SIM_TX_PIN      4         // ESP32 TX1 → SIM RXD
+#define SIM_BAUD        9600
+
+// Destination number for SMS uploads. Use full E.164 format (+country...).
+// This must be a Twilio (or Semaphore/etc.) inbound-capable number that
+// is webhooked to your /api/sms endpoint.
+// Twilio inbound number (US). E.164 format required — leading "+"
+// tells the SIM800L to dial international. Your SIM card must have
+// international SMS enabled / sufficient load (Globe/Smart: usually
+// works by default on prepaid, ~₱15/msg).
+#define SMS_TO_NUMBER   "+16513774630"
 
 // ── LED ────────────────────────────────────────────────────
 #define LED_PIN         2         // Built-in blue LED on most ESP32 dev boards
@@ -73,9 +103,15 @@
 #define DEVICE_ID       "bracelet-001"
 
 // ── Timing ─────────────────────────────────────────────────
-#define UPLOAD_INTERVAL_MS   10000UL   // upload every 10 s
+#define UPLOAD_INTERVAL_MS   10000UL   // HTTP upload every 10 s (WiFi path)
+#define SMS_INTERVAL_MS      900000UL  // SMS upload every 15 min (cellular path)
+#define SIM_BOOT_DELAY_MS    8000UL    // SIM800L cold-boot settle time
 #define WIFI_TIMEOUT_MS      15000UL   // max wait when joining a network
 #define MAX_RECONNECT_TRIES  3         // before falling back to AP mode
+
+// Set to 1 to send SMS only when WiFi is unavailable (saves money).
+// Set to 0 to ALWAYS send SMS in parallel with HTTP (redundant but safe).
+#define SMS_ONLY_AS_FALLBACK 0
 
 
 // ═══════════════════════════════════════════════════════════
@@ -84,11 +120,14 @@
 Preferences     prefs;
 WebServer       server(80);
 TinyGPSPlus     gps;
-HardwareSerial  gpsSerial(2);   // UART2
+HardwareSerial  gpsSerial(2);   // UART2 — GPS
+HardwareSerial  simSerial(1);   // UART1 — SIM800L
 
 String          savedSSID, savedPass;
 bool            wifiConnected     = false;
-unsigned long   lastUpload        = 0;
+bool            simReady          = false;   // SIM responded to AT and registered
+unsigned long   lastUpload        = 0;       // last HTTP upload timestamp
+unsigned long   lastSmsUpload     = 0;       // last SMS upload timestamp
 unsigned long   lastProgressPrint = 0;
 bool            ledState          = false;
 int             reconnectCount    = 0;
@@ -290,6 +329,121 @@ void startAPMode() {
 
 
 // ═══════════════════════════════════════════════════════════
+//  SIM800L helpers
+//  -----------------------------------------------------------
+//  The SIM800L speaks AT commands over UART. Pattern is always:
+//     1. send "AT+SOMETHING\r\n"
+//     2. read everything that comes back until idle
+//     3. look for "OK" / "ERROR" / specific tokens
+//  simCollect() implements step 2 with an idle-timeout — it keeps
+//  reading as long as bytes are arriving and only returns once the
+//  module has been quiet for ~200 ms (or the deadline expires).
+// ═══════════════════════════════════════════════════════════
+
+String simCollect(unsigned long timeoutMs) {
+  String out;
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    while (simSerial.available()) {
+      char c = simSerial.read();
+      out += c;
+      // Reset the idle window on every received byte so we keep
+      // reading multi-line responses without truncating.
+      deadline = millis() + 200;
+    }
+  }
+  out.trim();
+  return out;
+}
+
+// Ping the module with bare "AT" until it answers OK. The SIM800L
+// can take several seconds to come up after power-on — that's why
+// setup() also does a coarse delay before this is called.
+bool simWaitForOK() {
+  for (int i = 1; i <= 10; i++) {
+    simSerial.println("AT");
+    String r = simCollect(1500);
+    Serial.printf("[SIM] AT attempt %d/10 → [%s]\n", i, r.c_str());
+    if (r.indexOf("OK") >= 0) return true;
+  }
+  return false;
+}
+
+// AT+CREG? returns "+CREG: <n>,<stat>". stat=1 → registered home,
+// stat=5 → registered roaming. Anything else means not yet on network.
+bool simWaitForNetwork() {
+  for (int i = 1; i <= 60; i++) {
+    simSerial.println("AT+CREG?");
+    String r = simCollect(2000);
+    if (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0) {
+      Serial.printf("[SIM] Network registered after %ds\n", i);
+      return true;
+    }
+    delay(500);
+  }
+  Serial.println("[SIM] Network registration timed out.");
+  return false;
+}
+
+// One-time module bring-up. Call from setup().
+bool simInit() {
+  Serial.println("[SIM] Booting SIM800L...");
+  simSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+  delay(SIM_BOOT_DELAY_MS);
+  while (simSerial.available()) simSerial.read();   // flush boot noise
+
+  if (!simWaitForOK()) {
+    Serial.println("[SIM] No response. Check power/wiring.");
+    return false;
+  }
+  if (!simWaitForNetwork()) return false;
+
+  // Switch to text-mode SMS once. Stays set until power loss.
+  simSerial.println("AT+CMGF=1");
+  simCollect(2000);
+  return true;
+}
+
+// Send one SMS. Blocking — typical wall time ~5–10 s.
+// Returns true if module reported "+CMGS:" (queued for delivery).
+bool sendSMS(const char* number, const String& message) {
+  if (!simReady) return false;
+
+  // CMGS expects the number in a quoted string, then the body, then
+  // a literal Ctrl+Z (0x1A) byte to mark end-of-message.
+  simSerial.print("AT+CMGS=\"");
+  simSerial.print(number);
+  simSerial.println("\"");
+  String r1 = simCollect(3000);
+  // Module should echo "> " prompt before accepting the body.
+  if (r1.indexOf('>') < 0) {
+    Serial.printf("[SIM] No '>' prompt: [%s]\n", r1.c_str());
+    return false;
+  }
+
+  simSerial.print(message);
+  delay(100);
+  simSerial.write(26);                  // Ctrl+Z = send
+
+  String r2 = simCollect(15000);        // SMS dispatch can take a while
+  Serial.printf("[SIM] CMGS reply: [%s]\n", r2.c_str());
+  return r2.indexOf("+CMGS") >= 0 || r2.indexOf("OK") >= 0;
+}
+
+// Build the compact pipe-delimited payload the webhook parses.
+// Format: NAVIO|<device_id>|<lat>|<lng>|<speed_kmh>|<sats>
+// Lat/lng kept to 6 decimals (~11 cm precision), full message stays
+// well under the 160-char single-segment SMS limit.
+String buildSmsPayload(double lat, double lng, double spd, int sats) {
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+           "NAVIO|%s|%.6f|%.6f|%.1f|%d",
+           DEVICE_ID, lat, lng, spd, sats);
+  return String(buf);
+}
+
+
+// ═══════════════════════════════════════════════════════════
 //  GPS upload  — returns true on HTTP 2xx
 // ═══════════════════════════════════════════════════════════
 bool uploadLocation(double lat, double lng, double speedKmh, int satellites) {
@@ -335,6 +489,11 @@ void setup() {
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.println("[GPS] UART2 started");
 
+  // Bring up SIM800L. If it fails we keep going — HTTP path may
+  // still work — but SMS uploads will be skipped.
+  simReady = simInit();
+  Serial.printf("[SIM] %s\n", simReady ? "READY" : "UNAVAILABLE");
+
   prefs.begin("wifi", true);
   savedSSID = prefs.getString("ssid", "");
   savedPass = prefs.getString("pass", "");
@@ -375,6 +534,29 @@ void loop() {
 
   // Serve the web portal in both AP and STA mode
   server.handleClient();
+
+  // ── SMS upload (independent of WiFi) ─────────────────────
+  // Runs in any mode (AP or STA). Only attempts when:
+  //   - SIM module came up successfully in setup()
+  //   - GPS has a valid fix
+  //   - SMS_INTERVAL_MS has elapsed since last attempt
+  //   - if SMS_ONLY_AS_FALLBACK is set, only when WiFi is down
+  if (simReady && gps.location.isValid()) {
+    bool wifiPathOk    = wifiConnected && WiFi.status() == WL_CONNECTED;
+    bool smsAllowed    = !SMS_ONLY_AS_FALLBACK || !wifiPathOk;
+    if (smsAllowed && (millis() - lastSmsUpload >= SMS_INTERVAL_MS)) {
+      lastSmsUpload = millis();
+      double lat  = gps.location.lat();
+      double lng  = gps.location.lng();
+      double spd  = gps.speed.isValid()      ? gps.speed.kmph()            : 0.0;
+      int    sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+
+      String payload = buildSmsPayload(lat, lng, spd, sats);
+      Serial.printf("[SMS] → %s : %s\n", SMS_TO_NUMBER, payload.c_str());
+      bool ok = sendSMS(SMS_TO_NUMBER, payload);
+      Serial.printf("[SMS] %s\n", ok ? "delivered to carrier" : "FAILED");
+    }
+  }
 
   // ── AP mode: slow blink, nothing else to do ──────────────
   if (!wifiConnected) {
