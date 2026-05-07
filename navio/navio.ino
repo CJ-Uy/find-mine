@@ -113,12 +113,23 @@
 // Set to 0 to ALWAYS send SMS in parallel with HTTP (redundant but safe).
 #define SMS_ONLY_AS_FALLBACK 0
 
-// ── SIM balance (carrier-specific USSD) ────────────────────
-// Smart's *214# returns +CUSD: 2 (rejected) on some prepaid plans —
-// *123# launches the main menu and on most Smart accounts replies
-// with the balance as the first line of the menu prompt.
-// Result text gets POSTed to BALANCE_URL when WiFi is up.
+// ── SIM balance (carrier-specific) ─────────────────────────
+// Two methods:
+//   USSD : dial *123# (Smart) — returns regular load only, can't see
+//          active promos / Flexi / Power ALL allocations.
+//   SMS  : text STATUS to 214 — returns full promo breakdown including
+//          GB remaining, expiry, etc. Free on Smart. Slower (~10–30 s
+//          for Smart's reply) but the only way to see promo balance.
+//
+// Set to 1 to use the SMS-based query, 0 for USSD.
+// Smart RC:1100 — BAL to 214 retired. RC:2099 — PROMO/STATUS unavailable.
+// USSD *123# is the only working path. Returns main menu w/ balance +
+// active promo list (POWER ALL etc.). For deeper allocation (GB left)
+// you'd need interactive USSD nav — not implemented.
+#define BALANCE_USE_SMS 0
 #define BALANCE_USSD    "*123#"
+#define BALANCE_SHORTCODE "214"
+#define BALANCE_KEYWORD "PROMO"
 #define BALANCE_URL     "https://navio.cjuy.dev/api/balance"
 
 
@@ -395,6 +406,26 @@ bool simInit() {
   return true;
 }
 
+// Read SIM serial until any of the supplied tokens appears in the
+// buffer, or the hard timeout expires. Returns the full buffer text
+// regardless of outcome — caller checks for tokens itself.
+//
+// We need this for async URC-style replies (like +CMGS for SMS or
+// +CUSD for USSD) where the module may go silent for many seconds
+// between an immediate "OK" and the actual network confirmation.
+// simCollect's 200 ms idle window exits early in those gaps.
+String simWaitForAny(const char* a, const char* b, unsigned long timeoutMs) {
+  String buf;
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    while (simSerial.available()) buf += (char)simSerial.read();
+    if (a && buf.indexOf(a) >= 0) return buf;
+    if (b && buf.indexOf(b) >= 0) return buf;
+    delay(20);
+  }
+  return buf;
+}
+
 // Send one SMS. Blocking — typical wall time ~5–10 s.
 // Returns true if module reported "+CMGS:" (queued for delivery).
 bool sendSMS(const char* number, const String& message) {
@@ -405,8 +436,9 @@ bool sendSMS(const char* number, const String& message) {
   simSerial.print("AT+CMGS=\"");
   simSerial.print(number);
   simSerial.println("\"");
-  String r1 = simCollect(3000);
-  // Module should echo "> " prompt before accepting the body.
+  // Wait for the "> " prompt instead of generic idle. Some firmwares
+  // send the prompt 1–2 s after the AT, well past simCollect's 200 ms.
+  String r1 = simWaitForAny(">", "ERROR", 5000);
   if (r1.indexOf('>') < 0) {
     Serial.printf("[SIM] No '>' prompt: [%s]\n", r1.c_str());
     return false;
@@ -416,9 +448,12 @@ bool sendSMS(const char* number, const String& message) {
   delay(100);
   simSerial.write(26);                  // Ctrl+Z = send
 
-  String r2 = simCollect(15000);        // SMS dispatch can take a while
+  // Wait specifically for "+CMGS" (success URC) or "ERROR". Network
+  // confirmation can land 2–15 s later. simCollect would exit too
+  // early on short messages and we'd see only the echoed body.
+  String r2 = simWaitForAny("+CMGS", "ERROR", 30000);
   Serial.printf("[SIM] CMGS reply: [%s]\n", r2.c_str());
-  return r2.indexOf("+CMGS") >= 0 || r2.indexOf("OK") >= 0;
+  return r2.indexOf("+CMGS") >= 0;
 }
 
 // Query prepaid balance via USSD. Returns true if a response was
@@ -523,6 +558,110 @@ bool simQueryBalance(String& out) {
 
   out = reply;
   return true;
+}
+
+// Send STATUS to 214, wait for the reply SMS, read its body.
+// Returns true if a reply was captured into `out`.
+//
+// Flow:
+//   1. Wipe SIM message storage so we don't pick up stale replies.
+//   2. Configure new-message indication so the module emits +CMTI URCs.
+//   3. Send the SMS via the existing sendSMS() path.
+//   4. Watch the SIM serial for "+CMTI: \"SM\",<idx>" — this fires
+//      when a new SMS lands. Smart's STATUS replies typically arrive
+//      in 5–30 seconds.
+//   5. Read body via AT+CMGR=<idx>, then AT+CMGD=<idx> to delete it.
+bool simQueryBalanceViaSMS(String& out) {
+  if (!simReady) return false;
+
+  // Wipe storage and enable new-message URCs. AT+CNMI=2,1: route
+  // delivery indication to TE (us), don't push the body inline.
+  simSerial.println("AT+CMGD=1,4");        // delete all stored SMS
+  simCollect(2500);
+  simSerial.println("AT+CNMI=2,1,0,0,0");  // enable +CMTI URCs
+  simCollect(1500);
+  while (simSerial.available()) simSerial.read();   // drain noise
+
+  Serial.printf("[Balance] sending %s to %s...\n",
+                BALANCE_KEYWORD, BALANCE_SHORTCODE);
+  if (!sendSMS(BALANCE_SHORTCODE, BALANCE_KEYWORD)) {
+    Serial.println("[Balance] STATUS SMS send failed");
+    return false;
+  }
+
+  // Wait up to 45 s for the reply. Smart usually replies in <15 s but
+  // promos sometimes take longer.
+  unsigned long deadline = millis() + 45000UL;
+  String buf;
+  int msgIdx = -1;
+
+  while (millis() < deadline && msgIdx < 0) {
+    while (simSerial.available()) buf += (char)simSerial.read();
+
+    int cmti = buf.indexOf("+CMTI:");
+    if (cmti >= 0) {
+      // Find the first digit run after "+CMTI:" — that's the index.
+      int comma = buf.indexOf(',', cmti);
+      if (comma >= 0) {
+        String numStr;
+        for (size_t i = comma + 1; i < buf.length(); i++) {
+          char c = buf[i];
+          if (c >= '0' && c <= '9') numStr += c;
+          else if (numStr.length() > 0) break;
+        }
+        if (numStr.length() > 0) msgIdx = numStr.toInt();
+      }
+    }
+    delay(100);
+  }
+
+  if (msgIdx < 0) {
+    Serial.println("[Balance] Timed out waiting for STATUS reply");
+    return false;
+  }
+  Serial.printf("[Balance] inbound SMS at index %d\n", msgIdx);
+
+  // Read the message. Reply format from SIM800L:
+  //   +CMGR: "REC UNREAD","214",,"26/05/08,12:34:56+32"
+  //   <body line(s)>
+  //   <blank>
+  //   OK
+  simSerial.print("AT+CMGR=");
+  simSerial.println(msgIdx);
+  String r = simCollect(6000);
+
+  int hdr = r.indexOf("+CMGR:");
+  if (hdr < 0) {
+    Serial.printf("[Balance] CMGR missing header: [%s]\n", r.c_str());
+    return false;
+  }
+  int hdrEnd = r.indexOf('\n', hdr);
+  if (hdrEnd < 0) return false;
+
+  // Body runs from hdrEnd+1 up to the trailing OK.
+  int okIdx = r.lastIndexOf("OK");
+  String body = (okIdx > hdrEnd)
+                  ? r.substring(hdrEnd + 1, okIdx)
+                  : r.substring(hdrEnd + 1);
+  body.trim();
+
+  // Free up SIM storage for next round.
+  simSerial.print("AT+CMGD=");
+  simSerial.println(msgIdx);
+  simCollect(2000);
+
+  if (body.length() == 0) return false;
+  out = body;
+  return true;
+}
+
+// Dispatch to the configured balance method (SMS or USSD).
+bool queryBalance(String& out) {
+#if BALANCE_USE_SMS
+  return simQueryBalanceViaSMS(out);
+#else
+  return simQueryBalance(out);
+#endif
 }
 
 // POST balance text to /api/balance. Server stores latest value
@@ -634,7 +773,7 @@ void setup() {
     // attempts if the SIM module came up successfully.
     if (simReady) {
       String bal;
-      if (simQueryBalance(bal)) {
+      if (queryBalance(bal)) {
         Serial.printf("[Balance] %s\n", bal.c_str());
         lastBalanceText = bal;
         if (postBalance(bal)) {
@@ -706,7 +845,7 @@ void loop() {
   if (balancePending && simReady && wifiConnected
       && WiFi.status() == WL_CONNECTED) {
     String bal;
-    if (simQueryBalance(bal)) {
+    if (queryBalance(bal)) {
       Serial.printf("[Balance] %s\n", bal.c_str());
       lastBalanceText = bal;
       if (postBalance(bal)) balancePending = false;
