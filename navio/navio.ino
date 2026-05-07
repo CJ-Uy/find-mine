@@ -103,15 +103,21 @@
 #define DEVICE_ID       "bracelet-001"
 
 // ── Timing ─────────────────────────────────────────────────
-#define UPLOAD_INTERVAL_MS   10000UL   // HTTP upload every 10 s (WiFi path)
-#define SMS_INTERVAL_MS      900000UL  // SMS upload every 15 min (cellular path)
-#define SIM_BOOT_DELAY_MS    8000UL    // SIM800L cold-boot settle time
-#define WIFI_TIMEOUT_MS      15000UL   // max wait when joining a network
-#define MAX_RECONNECT_TRIES  3         // before falling back to AP mode
+#define UPLOAD_INTERVAL_MS   10000UL    // HTTP upload every 10 s (WiFi path)
+#define SMS_INTERVAL_MS      900000UL   // SMS upload every 15 min (cellular path)
+#define SIM_BOOT_DELAY_MS    8000UL     // SIM800L cold-boot settle time
+#define WIFI_TIMEOUT_MS      15000UL    // max wait when joining a network
+#define MAX_RECONNECT_TRIES  3          // before falling back to AP mode
 
 // Set to 1 to send SMS only when WiFi is unavailable (saves money).
 // Set to 0 to ALWAYS send SMS in parallel with HTTP (redundant but safe).
 #define SMS_ONLY_AS_FALLBACK 0
+
+// ── SIM balance (carrier-specific USSD) ────────────────────
+// Smart : *214#     Globe : *143#     DITO : *888#
+// Result text gets POSTed to BALANCE_URL when WiFi is up.
+#define BALANCE_USSD    "*214#"
+#define BALANCE_URL     "https://navio.cjuy.dev/api/balance"
 
 
 // ═══════════════════════════════════════════════════════════
@@ -124,51 +130,34 @@ HardwareSerial  gpsSerial(2);   // UART2 — GPS
 HardwareSerial  simSerial(1);   // UART1 — SIM800L
 
 String          savedSSID, savedPass;
-bool            wifiConnected     = false;
-bool            simReady          = false;   // SIM responded to AT and registered
-unsigned long   lastUpload        = 0;       // last HTTP upload timestamp
-unsigned long   lastSmsUpload     = 0;       // last SMS upload timestamp
-unsigned long   lastProgressPrint = 0;
-bool            ledState          = false;
-int             reconnectCount    = 0;
+bool            wifiConnected      = false;
+bool            simReady           = false;   // SIM responded to AT and registered
+unsigned long   lastUpload         = 0;       // last HTTP upload timestamp
+unsigned long   lastSmsUpload      = 0;       // last SMS upload timestamp
+bool            balancePending     = true;    // request balance refresh (boot + after each SMS)
+unsigned long   lastProgressPrint  = 0;
+bool            ledState           = false;
+int             reconnectCount     = 0;
+bool            firstSmsPending    = true;    // fire SMS immediately on first GPS fix
+String          lastBalanceText    = "";      // last balance reply (cached for re-POST)
 
 
 // ═══════════════════════════════════════════════════════════
-//  LED helpers
+//  LED helpers — STEALTH MODE
+//  -----------------------------------------------------------
+//  All LED activity disabled for discretion. Functions kept as
+//  no-ops so call sites elsewhere in the file don't need edits.
+//  Note: the red power LED on most ESP32 dev boards is hardwired
+//  to VCC and CANNOT be turned off in software — desolder it if
+//  you need true darkness.
 // ═══════════════════════════════════════════════════════════
 
-// Blocking blink — used for upload result bursts
-void ledBlink(int times, int onMs, int offMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(onMs);
-    digitalWrite(LED_PIN, LOW);
-    if (i < times - 1) delay(offMs);
-  }
+void ledBlink(int /*times*/, int /*onMs*/, int /*offMs*/) {
+  // intentionally empty — stealth mode
 }
 
-/*
- * Non-blocking background blink — call every loop iteration.
- *
- * mode 0 → AP (no WiFi)    : slow  1000 on / 1000 off
- * mode 1 → no GPS fix      : fast   100 on /  100 off
- * mode 2 → GPS fix         : pulse 1000 on / 2000 off
- */
-void ledTick(int mode) {
-  unsigned long onMs, offMs;
-  switch (mode) {
-    case 0:  onMs = 1000; offMs = 1000; break;
-    case 1:  onMs =  100; offMs =  100; break;
-    default: onMs = 1000; offMs = 2000; break;
-  }
-
-  unsigned long phase = millis() % (onMs + offMs);
-  bool shouldBeOn = (phase < onMs);
-
-  if (shouldBeOn != ledState) {
-    ledState = shouldBeOn;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-  }
+void ledTick(int /*mode*/) {
+  // intentionally empty — stealth mode
 }
 
 
@@ -430,6 +419,66 @@ bool sendSMS(const char* number, const String& message) {
   return r2.indexOf("+CMGS") >= 0 || r2.indexOf("OK") >= 0;
 }
 
+// Query prepaid balance via USSD. Returns true if a response was
+// captured into `out`. Smart's *214# replies with text like
+// "Your balance is P 47.00 valid until ...". Globe/DITO format
+// differs but we don't parse — we send the raw text to the server
+// and let the server display it.
+//
+// AT+CUSD=1,"<code>",15
+//   1  → enable result codes
+//   15 → GSM 7-bit alphabet (works for plain ASCII replies)
+//
+// Module reply pattern:
+//   OK
+//   +CUSD: 0,"Your balance is P 47.00...",15
+bool simQueryBalance(String& out) {
+  if (!simReady) return false;
+
+  // Some firmwares need CUSD enabled first. Idempotent — safe to spam.
+  simSerial.println("AT+CUSD=1");
+  simCollect(1500);
+
+  simSerial.print("AT+CUSD=1,\"");
+  simSerial.print(BALANCE_USSD);
+  simSerial.println("\",15");
+
+  // USSD round-trip varies wildly by carrier. 20 s is generous.
+  String r = simCollect(20000);
+  Serial.printf("[USSD] raw: [%s]\n", r.c_str());
+
+  int idx = r.indexOf("+CUSD:");
+  if (idx < 0) return false;
+  int q1 = r.indexOf('"', idx);
+  int q2 = r.indexOf('"', q1 + 1);
+  if (q1 < 0 || q2 <= q1) return false;
+
+  out = r.substring(q1 + 1, q2);
+  out.trim();
+  return out.length() > 0;
+}
+
+// POST balance text to /api/balance. Server stores latest value
+// per device for display on the website. Only call when WiFi is up.
+bool postBalance(const String& text) {
+  HTTPClient http;
+  http.begin(BALANCE_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+
+  StaticJsonDocument<384> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["balance"]   = text;
+
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  http.end();
+  Serial.printf("[Balance] POST → %d\n", code);
+  return code >= 200 && code < 300;
+}
+
 // Build the compact pipe-delimited payload the webhook parses.
 // Format: NAVIO|<device_id>|<lat>|<lng>|<speed_kmh>|<sats>
 // Lat/lng kept to 6 decimals (~11 cm precision), full message stays
@@ -483,8 +532,8 @@ void setup() {
   delay(200);
   Serial.println("\n[Boot] Navio GPS Tracker");
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  // Stealth mode — keep LED pin tri-stated so it doesn't light up.
+  pinMode(LED_PIN, INPUT);
 
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.println("[GPS] UART2 started");
@@ -512,14 +561,25 @@ void setup() {
     MDNS.begin(HOSTNAME);
     registerWebRoutes();
     Serial.printf("[Boot] Uploading every %lu s\n", UPLOAD_INTERVAL_MS / 1000);
+
+    // Boot-time balance refresh — runs immediately after WiFi is up so
+    // the website shows current load before any SMS has fired. Only
+    // attempts if the SIM module came up successfully.
+    if (simReady) {
+      String bal;
+      if (simQueryBalance(bal)) {
+        Serial.printf("[Balance] %s\n", bal.c_str());
+        lastBalanceText = bal;
+        if (postBalance(bal)) {
+          balancePending = false;       // boot refresh done
+        }
+      } else {
+        Serial.println("[Balance] USSD query failed at boot — will retry in loop");
+      }
+    }
   }
 
-  Serial.println("[LED] Key:");
-  Serial.println("       Slow blink  (1s)   = AP mode, waiting for config");
-  Serial.println("       Fast blink  (100ms) = Connected, searching for GPS fix");
-  Serial.println("       Long pulse  (1s/2s) = GPS fix acquired, uploading");
-  Serial.println("       3x rapid blink      = Upload success");
-  Serial.println("       2x slow blink       = Upload failed");
+  Serial.println("[LED] Stealth mode — all blinking disabled.");
 }
 
 
@@ -536,25 +596,59 @@ void loop() {
   server.handleClient();
 
   // ── SMS upload (independent of WiFi) ─────────────────────
-  // Runs in any mode (AP or STA). Only attempts when:
-  //   - SIM module came up successfully in setup()
-  //   - GPS has a valid fix
-  //   - SMS_INTERVAL_MS has elapsed since last attempt
-  //   - if SMS_ONLY_AS_FALLBACK is set, only when WiFi is down
+  // Runs in any mode (AP or STA). Fires:
+  //   - immediately on the FIRST GPS fix after boot, then
+  //   - every SMS_INTERVAL_MS after that.
+  //   - if SMS_ONLY_AS_FALLBACK is set, only when WiFi is down.
   if (simReady && gps.location.isValid()) {
-    bool wifiPathOk    = wifiConnected && WiFi.status() == WL_CONNECTED;
-    bool smsAllowed    = !SMS_ONLY_AS_FALLBACK || !wifiPathOk;
-    if (smsAllowed && (millis() - lastSmsUpload >= SMS_INTERVAL_MS)) {
-      lastSmsUpload = millis();
+    bool wifiPathOk = wifiConnected && WiFi.status() == WL_CONNECTED;
+    bool smsAllowed = !SMS_ONLY_AS_FALLBACK || !wifiPathOk;
+    bool intervalElapsed = (millis() - lastSmsUpload) >= SMS_INTERVAL_MS;
+    if (smsAllowed && (firstSmsPending || intervalElapsed)) {
       double lat  = gps.location.lat();
       double lng  = gps.location.lng();
       double spd  = gps.speed.isValid()      ? gps.speed.kmph()            : 0.0;
       int    sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
 
       String payload = buildSmsPayload(lat, lng, spd, sats);
-      Serial.printf("[SMS] → %s : %s\n", SMS_TO_NUMBER, payload.c_str());
+      Serial.printf("[SMS] → %s : %s%s\n",
+                    SMS_TO_NUMBER, payload.c_str(),
+                    firstSmsPending ? "  (FIRST FIX)" : "");
       bool ok = sendSMS(SMS_TO_NUMBER, payload);
       Serial.printf("[SMS] %s\n", ok ? "delivered to carrier" : "FAILED");
+
+      // Mark interval start regardless of success — failed SMS still
+      // costs ~10 s of module time, don't hammer it. Clear first-fire
+      // only on success so a failed first attempt retries on next loop.
+      lastSmsUpload = millis();
+      if (ok) {
+        firstSmsPending = false;
+        // Each SMS costs load — flag a balance refresh so the website
+        // shows current credit. Will fire below when WiFi is available.
+        balancePending = true;
+      }
+    }
+  }
+
+  // ── Balance refresh (USSD → HTTP) ────────────────────────
+  // Fires only when:
+  //   - balancePending is set (boot OR after a successful SMS)
+  //   - SIM module is ready
+  //   - WiFi is connected (server otherwise unreachable)
+  // The USSD query itself does NOT cost load — it's free.
+  if (balancePending && simReady && wifiConnected
+      && WiFi.status() == WL_CONNECTED) {
+    String bal;
+    if (simQueryBalance(bal)) {
+      Serial.printf("[Balance] %s\n", bal.c_str());
+      lastBalanceText = bal;
+      if (postBalance(bal)) balancePending = false;
+      // If USSD worked but HTTP failed, leave balancePending=true
+      // so the next loop retries the POST without re-querying USSD.
+    } else {
+      Serial.println("[Balance] USSD query failed — will retry");
+      // Don't clear the flag; try again next loop iteration. USSD
+      // can flake on weak signal — a retry usually succeeds.
     }
   }
 

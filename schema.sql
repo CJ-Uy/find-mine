@@ -11,3 +11,11 @@ CREATE TABLE IF NOT EXISTS locations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_device_ts ON locations (device_id, ts DESC);
+
+-- One row per device, holds the most recent prepaid balance reply
+-- as raw text from the carrier USSD response (e.g. *214# on Smart).
+CREATE TABLE IF NOT EXISTS sim_balances (
+  device_id TEXT PRIMARY KEY,
+  balance   TEXT NOT NULL,
+  ts        TEXT NOT NULL
+);
