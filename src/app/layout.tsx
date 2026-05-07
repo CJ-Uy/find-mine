@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-	title: "FindMine",
+	title: "Navio",
 	description: "Real-time GPS tracker",
 };
 

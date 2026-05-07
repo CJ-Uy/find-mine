@@ -179,7 +179,7 @@ export default function TrackerMap() {
     <div className="relative h-screen w-screen overflow-hidden bg-gray-950">
       <APIProvider apiKey={apiKey}>
         <Map
-          mapId="findmine-map"
+          mapId="navio-map"
           defaultCenter={center}
           defaultZoom={15}
           center={location ? center : undefined}
@@ -200,7 +200,7 @@ export default function TrackerMap() {
       {/* Top bar */}
       <div className="absolute top-4 left-4 right-4 flex items-center justify-between gap-3 pointer-events-none">
         <div className="flex items-center gap-2 bg-gray-900/90 backdrop-blur border border-gray-700 rounded-xl px-4 py-2.5 pointer-events-auto">
-          <span className="text-white font-bold text-lg tracking-tight">FindMine</span>
+          <span className="text-white font-bold text-lg tracking-tight">Navio</span>
         </div>
 
         {devices.length > 0 && (

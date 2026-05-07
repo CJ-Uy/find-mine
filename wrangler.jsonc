@@ -8,7 +8,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "find-mine",
+	"name": "navio",
 	"account_id": "8527ec1369d46f55304a6f59ab5356e4",
 	"main": ".open-next/worker.js",
 	"compatibility_date": "2026-05-04",
@@ -30,7 +30,7 @@
 			// Self-reference service binding, the service name must match the worker name
 			// see https://opennext.js.org/cloudflare/caching
 			"binding": "WORKER_SELF_REFERENCE",
-			"service": "find-mine"
+			"service": "navio"
 		}
 	],
 	"observability": {
@@ -40,7 +40,7 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "find-mine",
+			"database_name": "navio",
 			"database_id": "debfa01b-6d8a-4233-aa66-3af1c096c6bf"
 		}
 	]
