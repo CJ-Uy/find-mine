@@ -103,7 +103,7 @@
 #define DEVICE_ID       "bracelet-001"
 
 // ── Timing ─────────────────────────────────────────────────
-#define UPLOAD_INTERVAL_MS   30000UL    // HTTP upload every 30 s (WiFi path)
+#define UPLOAD_INTERVAL_MS   1000UL     // HTTP upload every 1 s (WiFi path — matches GPS 1 Hz output rate)
 #define SMS_INTERVAL_MS      1800000UL  // SMS every 30 min (cellular fallback only)
 // How long WiFi must be absent before SMS fallback activates.
 // Device will wait this long hoping WiFi comes back before burning load.
