@@ -103,15 +103,14 @@
 #define DEVICE_ID       "bracelet-001"
 
 // ── Timing ─────────────────────────────────────────────────
-#define UPLOAD_INTERVAL_MS   10000UL    // HTTP upload every 10 s (WiFi path)
-#define SMS_INTERVAL_MS      900000UL   // SMS upload every 15 min (cellular path)
+#define UPLOAD_INTERVAL_MS   30000UL    // HTTP upload every 30 s (WiFi path)
+#define SMS_INTERVAL_MS      1800000UL  // SMS every 30 min (cellular fallback only)
+// How long WiFi must be absent before SMS fallback activates.
+// Device will wait this long hoping WiFi comes back before burning load.
+#define WIFI_FALLBACK_DELAY_MS 1800000UL  // 30 min
 #define SIM_BOOT_DELAY_MS    8000UL     // SIM800L cold-boot settle time
 #define WIFI_TIMEOUT_MS      15000UL    // max wait when joining a network
 #define MAX_RECONNECT_TRIES  3          // before falling back to AP mode
-
-// Set to 1 to send SMS only when WiFi is unavailable (saves money).
-// Set to 0 to ALWAYS send SMS in parallel with HTTP (redundant but safe).
-#define SMS_ONLY_AS_FALLBACK 0
 
 // ── SIM balance (carrier-specific) ─────────────────────────
 // Two methods:
@@ -151,7 +150,11 @@ bool            balancePending     = true;    // request balance refresh (boot +
 unsigned long   lastProgressPrint  = 0;
 bool            ledState           = false;
 int             reconnectCount     = 0;
-bool            firstSmsPending    = true;    // fire SMS immediately on first GPS fix
+// Timestamp when WiFi was last confirmed working, then lost (or boot with no WiFi).
+// 0 = WiFi is currently connected. Non-zero = WiFi has been down since this moment.
+// SMS fallback fires only once wifiLostAt is set AND the WIFI_FALLBACK_DELAY_MS
+// window has elapsed — so a brief blip won't waste load.
+unsigned long   wifiLostAt         = 0;
 String          lastBalanceText    = "";      // last balance reply (cached for re-POST)
 
 
@@ -762,8 +765,13 @@ void setup() {
   }
 
   if (!wifiConnected) {
+    // WiFi unavailable from the start — begin counting toward SMS fallback now.
+    wifiLostAt = millis();
+    Serial.printf("[Boot] No WiFi — SMS fallback activates in %lu min\n",
+                  WIFI_FALLBACK_DELAY_MS / 60000UL);
     startAPMode();
   } else {
+    wifiLostAt = 0;   // WiFi is up — fallback not needed
     MDNS.begin(HOSTNAME);
     registerWebRoutes();
     Serial.printf("[Boot] Uploading every %lu s\n", UPLOAD_INTERVAL_MS / 1000);
@@ -801,37 +809,41 @@ void loop() {
   // Serve the web portal in both AP and STA mode
   server.handleClient();
 
-  // ── SMS upload (independent of WiFi) ─────────────────────
-  // Runs in any mode (AP or STA). Fires:
-  //   - immediately on the FIRST GPS fix after boot, then
-  //   - every SMS_INTERVAL_MS after that.
-  //   - if SMS_ONLY_AS_FALLBACK is set, only when WiFi is down.
-  if (simReady && gps.location.isValid()) {
-    bool wifiPathOk = wifiConnected && WiFi.status() == WL_CONNECTED;
-    bool smsAllowed = !SMS_ONLY_AS_FALLBACK || !wifiPathOk;
-    bool intervalElapsed = (millis() - lastSmsUpload) >= SMS_INTERVAL_MS;
-    if (smsAllowed && (firstSmsPending || intervalElapsed)) {
+  // ── SMS upload (cellular fallback only) ──────────────────
+  // SMS fires ONLY when:
+  //   1. WiFi has been absent for at least WIFI_FALLBACK_DELAY_MS (30 min)
+  //   2. The per-SMS interval has elapsed
+  //   3. We have a GPS fix
+  // The moment WiFi comes back, wifiLostAt is cleared → SMS stops.
+  if (simReady && gps.location.isValid() && wifiLostAt > 0) {
+    unsigned long wifiDownMs    = millis() - wifiLostAt;
+    bool fallbackActive         = wifiDownMs >= WIFI_FALLBACK_DELAY_MS;
+    bool intervalElapsed        = (millis() - lastSmsUpload) >= SMS_INTERVAL_MS;
+
+    if (fallbackActive && intervalElapsed) {
       double lat  = gps.location.lat();
       double lng  = gps.location.lng();
       double spd  = gps.speed.isValid()      ? gps.speed.kmph()            : 0.0;
       int    sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
 
       String payload = buildSmsPayload(lat, lng, spd, sats);
-      Serial.printf("[SMS] → %s : %s%s\n",
-                    SMS_TO_NUMBER, payload.c_str(),
-                    firstSmsPending ? "  (FIRST FIX)" : "");
+      Serial.printf("[SMS] WiFi down %lu min → %s : %s\n",
+                    wifiDownMs / 60000UL, SMS_TO_NUMBER, payload.c_str());
       bool ok = sendSMS(SMS_TO_NUMBER, payload);
       Serial.printf("[SMS] %s\n", ok ? "delivered to carrier" : "FAILED");
 
-      // Mark interval start regardless of success — failed SMS still
-      // costs ~10 s of module time, don't hammer it. Clear first-fire
-      // only on success so a failed first attempt retries on next loop.
+      // Stamp interval regardless of outcome — avoid hammering on failure.
       lastSmsUpload = millis();
       if (ok) {
-        firstSmsPending = false;
-        // Each SMS costs load — flag a balance refresh so the website
-        // shows current credit. Will fire below when WiFi is available.
+        // Each SMS costs load — refresh balance when WiFi comes back.
         balancePending = true;
+      }
+    } else if (!fallbackActive) {
+      unsigned long waitMin = (WIFI_FALLBACK_DELAY_MS - wifiDownMs) / 60000UL;
+      // Only print once per minute to avoid serial spam
+      if (millis() - lastProgressPrint >= 60000UL) {
+        Serial.printf("[SMS] WiFi down %lu min — SMS fallback in %lu min\n",
+                      wifiDownMs / 60000UL, waitMin);
       }
     }
   }
@@ -870,9 +882,20 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println();
     Serial.println("[WiFi] Lost connection, reconnecting...");
+    // Start the fallback clock on first drop detection.
+    if (wifiLostAt == 0) {
+      wifiLostAt = millis();
+      Serial.printf("[WiFi] Fallback clock started — SMS in %lu min if WiFi stays down\n",
+                    WIFI_FALLBACK_DELAY_MS / 60000UL);
+    }
     reconnectCount++;
     if (reconnectCount <= MAX_RECONNECT_TRIES) {
       wifiConnected = tryConnectWiFi(savedSSID, savedPass);
+      if (wifiConnected) {
+        wifiLostAt = 0;   // WiFi restored — disable SMS fallback
+        reconnectCount = 0;
+        Serial.println("[WiFi] Reconnected — SMS fallback cancelled");
+      }
     } else {
       Serial.println("[WiFi] Giving up, falling back to AP mode.");
       wifiConnected  = false;
@@ -880,6 +903,12 @@ void loop() {
       startAPMode();
     }
     return;
+  }
+
+  // WiFi is confirmed connected this iteration — keep wifiLostAt clear.
+  if (wifiLostAt != 0) {
+    wifiLostAt = 0;
+    Serial.println("[WiFi] Connection confirmed — SMS fallback off");
   }
 
   bool hasFix = gps.location.isValid();
