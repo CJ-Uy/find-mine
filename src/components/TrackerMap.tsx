@@ -9,6 +9,51 @@ import {
   useMap,
 } from '@vis.gl/react-google-maps';
 
+// Sits inside the Map context; pans imperatively so the user can still drag freely.
+function MapController({ target }: { target: { lat: number; lng: number } | null }) {
+  const map = useMap();
+  const centeredOnce = useRef(false);
+
+  useEffect(() => {
+    if (!map || !target) return;
+    if (!centeredOnce.current) {
+      map.panTo(target);
+      centeredOnce.current = true;
+    }
+  }, [map, target]);
+
+  return null;
+}
+
+// Recenter button — lives inside Map so it can call useMap().
+function RecenterButton({ target }: { target: { lat: number; lng: number } | null }) {
+  const map = useMap();
+  if (!target) return null;
+  return (
+    <button
+      onClick={() => map?.panTo(target)}
+      style={{
+        position: 'absolute',
+        bottom: 180,
+        right: 16,
+        zIndex: 10,
+        background: 'rgba(17,24,39,0.92)',
+        border: '1px solid rgba(75,85,99,0.8)',
+        borderRadius: 10,
+        color: '#e5e7eb',
+        fontSize: '0.78rem',
+        fontWeight: 600,
+        padding: '7px 13px',
+        cursor: 'pointer',
+        backdropFilter: 'blur(8px)',
+        letterSpacing: '0.03em',
+      }}
+    >
+      ⊙ Recenter
+    </button>
+  );
+}
+
 interface LocationRecord {
   device_id: string;
   lat: number;
@@ -182,11 +227,12 @@ export default function TrackerMap() {
           mapId="navio-map"
           defaultCenter={center}
           defaultZoom={15}
-          center={location ? center : undefined}
           gestureHandling="greedy"
           disableDefaultUI
           className="h-full w-full"
         >
+          <MapController target={location ? center : null} />
+          <RecenterButton target={location ? center : null} />
           {location && <LiveMarker position={center} online={location.online} />}
           {showHistory && trail.length > 0 && (
             <>
