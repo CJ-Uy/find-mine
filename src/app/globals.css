@@ -3,6 +3,11 @@
 :root {
 	--background: #ffffff;
 	--foreground: #171717;
+	--navio-yellow: #F5B731;
+	--navio-salmon: #E8918A;
+	--navio-teal: #0088A9;
+	--navio-purple: #3D1050;
+	--navio-berry: #8B1A4A;
 }
 
 @theme inline {
@@ -10,13 +15,11 @@
 	--color-foreground: var(--foreground);
 	--font-sans: var(--font-geist-sans);
 	--font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-	:root {
-		--background: #0a0a0a;
-		--foreground: #ededed;
-	}
+	--color-navio-yellow: var(--navio-yellow);
+	--color-navio-salmon: var(--navio-salmon);
+	--color-navio-teal: var(--navio-teal);
+	--color-navio-purple: var(--navio-purple);
+	--color-navio-berry: var(--navio-berry);
 }
 
 body {

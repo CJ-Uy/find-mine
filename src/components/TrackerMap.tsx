@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import Link from 'next/link';
 import {
   APIProvider,
   Map,
@@ -9,23 +10,23 @@ import {
   useMap,
 } from '@vis.gl/react-google-maps';
 
-// Sits inside the Map context; pans imperatively so the user can still drag freely.
+const C = {
+  yellow: '#fbbd40',
+  teal:   '#108ab1',
+  purple: '#2f0c33',
+  white:  '#ffffff',
+};
+
 function MapController({ target }: { target: { lat: number; lng: number } | null }) {
   const map = useMap();
   const centeredOnce = useRef(false);
-
   useEffect(() => {
     if (!map || !target) return;
-    if (!centeredOnce.current) {
-      map.panTo(target);
-      centeredOnce.current = true;
-    }
+    if (!centeredOnce.current) { map.panTo(target); centeredOnce.current = true; }
   }, [map, target]);
-
   return null;
 }
 
-// Recenter button — lives inside Map so it can call useMap().
 function RecenterButton({ target }: { target: { lat: number; lng: number } | null }) {
   const map = useMap();
   if (!target) return null;
@@ -33,20 +34,11 @@ function RecenterButton({ target }: { target: { lat: number; lng: number } | nul
     <button
       onClick={() => map?.panTo(target)}
       style={{
-        position: 'absolute',
-        bottom: 180,
-        right: 16,
-        zIndex: 10,
-        background: 'rgba(17,24,39,0.92)',
-        border: '1px solid rgba(75,85,99,0.8)',
-        borderRadius: 10,
-        color: '#e5e7eb',
-        fontSize: '0.78rem',
-        fontWeight: 600,
-        padding: '7px 13px',
-        cursor: 'pointer',
-        backdropFilter: 'blur(8px)',
-        letterSpacing: '0.03em',
+        position: 'absolute', bottom: 196, right: 16, zIndex: 10,
+        background: C.teal, border: 'none', borderRadius: 9999,
+        color: C.white, fontSize: '0.78rem', fontWeight: 700,
+        padding: '8px 16px', cursor: 'pointer', letterSpacing: '0.03em',
+        boxShadow: `0 4px 14px rgba(16,138,177,0.4)`,
       }}
     >
       ⊙ Recenter
@@ -64,35 +56,22 @@ interface LocationRecord {
   online: boolean;
 }
 
-interface TrailPoint {
-  lat: number;
-  lng: number;
-}
+interface TrailPoint { lat: number; lng: number; }
 
 const POLL_MS = 5_000;
 
 function HistoryPolyline({ trail }: { trail: TrailPoint[] }) {
-  const map = useMap();
+  const map     = useMap();
   const mapsLib = useMapsLibrary('maps');
-  const polylineRef = useRef<google.maps.Polyline | null>(null);
+  const polyRef = useRef<google.maps.Polyline | null>(null);
 
   useEffect(() => {
     if (!map || !mapsLib || trail.length < 2) return;
-
-    if (polylineRef.current) polylineRef.current.setMap(null);
-
-    polylineRef.current = new mapsLib.Polyline({
-      path: trail,
-      strokeColor: '#3b82f6',
-      strokeOpacity: 0.8,
-      strokeWeight: 3,
-      map,
+    polyRef.current?.setMap(null);
+    polyRef.current = new mapsLib.Polyline({
+      path: trail, strokeColor: C.teal, strokeOpacity: 0.9, strokeWeight: 4, map,
     });
-
-    return () => {
-      polylineRef.current?.setMap(null);
-      polylineRef.current = null;
-    };
+    return () => { polyRef.current?.setMap(null); polyRef.current = null; };
   }, [map, mapsLib, trail]);
 
   return null;
@@ -103,7 +82,7 @@ function TrailDots({ trail }: { trail: TrailPoint[] }) {
     <>
       {trail.slice(0, -1).map((pt, i) => (
         <AdvancedMarker key={i} position={pt}>
-          <div className="w-2 h-2 rounded-full bg-blue-400 opacity-60 border border-blue-200" />
+          <div style={{ width: 8, height: 8, borderRadius: '50%', background: C.yellow, border: '2px solid white', opacity: 0.8 }} />
         </AdvancedMarker>
       ))}
     </>
@@ -113,15 +92,11 @@ function TrailDots({ trail }: { trail: TrailPoint[] }) {
 function LiveMarker({ position, online }: { position: { lat: number; lng: number }; online: boolean }) {
   return (
     <AdvancedMarker position={position}>
-      <div className="relative flex items-center justify-center">
+      <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         {online && (
-          <div className="absolute w-8 h-8 rounded-full bg-blue-500 opacity-30 animate-ping" />
+          <div style={{ position: 'absolute', width: 32, height: 32, borderRadius: '50%', background: C.teal, opacity: 0.25 }} className="animate-ping" />
         )}
-        <div
-          className={`w-5 h-5 rounded-full border-2 border-white shadow-lg z-10 ${
-            online ? 'bg-blue-500' : 'bg-gray-400'
-          }`}
-        />
+        <div style={{ width: 20, height: 20, borderRadius: '50%', background: online ? C.teal : '#9ca3af', border: '3px solid white', boxShadow: '0 2px 8px rgba(0,0,0,0.2)', position: 'relative', zIndex: 1 }} />
       </div>
     </AdvancedMarker>
   );
@@ -130,57 +105,42 @@ function LiveMarker({ position, online }: { position: { lat: number; lng: number
 export default function TrackerMap() {
   const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 
-  const [devices, setDevices] = useState<string[]>([]);
+  const [devices,        setDevices]        = useState<string[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<string>('');
-  const [location, setLocation] = useState<LocationRecord | null>(null);
-  const [trail, setTrail] = useState<TrailPoint[]>([]);
-  const [showHistory, setShowHistory] = useState(false);
+  const [location,       setLocation]       = useState<LocationRecord | null>(null);
+  const [trail,          setTrail]          = useState<TrailPoint[]>([]);
+  const [showHistory,    setShowHistory]    = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error,          setError]          = useState<string | null>(null);
 
   const fetchDevices = useCallback(async () => {
     try {
-      const res = await fetch('/api/devices');
+      const res  = await fetch('/api/devices');
       const data = (await res.json()) as { devices: string[] };
       setDevices(data.devices ?? []);
-      if (data.devices?.length && !selectedDevice) {
-        setSelectedDevice(data.devices[0]);
-      }
-    } catch {
-      // silently retry next tick
-    }
+      if (data.devices?.length && !selectedDevice) setSelectedDevice(data.devices[0]);
+    } catch { /* retry next tick */ }
   }, [selectedDevice]);
 
   const fetchLocation = useCallback(async (deviceId: string) => {
     try {
       const res = await fetch(`/api/location/${encodeURIComponent(deviceId)}`);
-      if (res.status === 404) {
-        setLocation(null);
-        setError('Device not found or offline');
-        return;
-      }
-      const data = (await res.json()) as LocationRecord;
-      setLocation(data);
+      if (res.status === 404) { setLocation(null); setError('Device not found or offline'); return; }
+      setLocation((await res.json()) as LocationRecord);
       setError(null);
-    } catch {
-      setError('Failed to fetch location');
-    }
+    } catch { setError('Failed to fetch location'); }
   }, []);
 
   const fetchHistory = useCallback(async (deviceId: string) => {
     setLoadingHistory(true);
     try {
-      const res = await fetch(`/api/history/${encodeURIComponent(deviceId)}`);
+      const res  = await fetch(`/api/history/${encodeURIComponent(deviceId)}`);
       const data = (await res.json()) as { trail: TrailPoint[] };
       setTrail(data.trail ?? []);
-    } finally {
-      setLoadingHistory(false);
-    }
+    } finally { setLoadingHistory(false); }
   }, []);
 
-  useEffect(() => {
-    fetchDevices();
-  }, [fetchDevices]);
+  useEffect(() => { fetchDevices(); }, [fetchDevices]);
 
   useEffect(() => {
     if (!selectedDevice) return;
@@ -190,131 +150,149 @@ export default function TrackerMap() {
   }, [selectedDevice, fetchLocation]);
 
   useEffect(() => {
-    if (!selectedDevice || !showHistory) {
-      setTrail([]);
-      return;
-    }
+    if (!selectedDevice || !showHistory) { setTrail([]); return; }
     fetchHistory(selectedDevice);
   }, [selectedDevice, showHistory, fetchHistory]);
 
   if (!apiKey) {
     return (
-      <div className="flex items-center justify-center h-screen bg-gray-950 text-white">
-        <div className="text-center space-y-2">
-          <p className="text-lg font-semibold">Missing Google Maps API key</p>
-          <p className="text-sm text-gray-400">
-            Set <code className="bg-gray-800 px-1 rounded">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</code> in{' '}
-            <code className="bg-gray-800 px-1 rounded">.env.local</code>
+      <div style={{ background: C.purple, display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: C.white }}>
+        <div style={{ textAlign: 'center' }}>
+          <p style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Missing Google Maps API key</p>
+          <p style={{ color: 'rgba(255,255,255,.5)', fontSize: 14 }}>
+            Set <code style={{ background: 'rgba(251,189,64,.15)', color: C.yellow, padding: '2px 6px', borderRadius: 4 }}>NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</code> in <code style={{ background: 'rgba(251,189,64,.15)', color: C.yellow, padding: '2px 6px', borderRadius: 4 }}>.env.local</code>
           </p>
         </div>
       </div>
     );
   }
 
-  const center = location ? { lat: location.lat, lng: location.lng } : { lat: 14.6401, lng: 121.0773 };
-
+  const center  = location ? { lat: location.lat, lng: location.lng } : { lat: 14.6401, lng: 121.0773 };
   const lastSeen = location
     ? new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).format(
-        -Math.round((Date.now() - new Date(location.ts).getTime()) / 1000),
-        'second'
+        -Math.round((Date.now() - new Date(location.ts).getTime()) / 1000), 'second'
       )
     : null;
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-gray-950">
+    <div style={{ position: 'relative', height: '100vh', width: '100vw', overflow: 'hidden', background: C.purple }}>
       <APIProvider apiKey={apiKey}>
-        <Map
-          mapId="navio-map"
-          defaultCenter={center}
-          defaultZoom={15}
-          gestureHandling="greedy"
-          disableDefaultUI
-          className="h-full w-full"
-        >
+        <Map mapId="navio-map" defaultCenter={center} defaultZoom={15} gestureHandling="greedy" disableDefaultUI className="h-full w-full">
           <MapController target={location ? center : null} />
           <RecenterButton target={location ? center : null} />
           {location && <LiveMarker position={center} online={location.online} />}
-          {showHistory && trail.length > 0 && (
-            <>
-              <HistoryPolyline trail={trail} />
-              <TrailDots trail={trail} />
-            </>
-          )}
+          {showHistory && trail.length > 0 && <><HistoryPolyline trail={trail} /><TrailDots trail={trail} /></>}
         </Map>
       </APIProvider>
 
-      {/* Top bar */}
-      <div className="absolute top-4 left-4 right-4 flex items-center justify-between gap-3 pointer-events-none">
-        <div className="flex items-center gap-2 bg-gray-900/90 backdrop-blur border border-gray-700 rounded-xl px-4 py-2.5 pointer-events-auto">
-          <span className="text-white font-bold text-lg tracking-tight">Navio</span>
+      {/* ── Top bar ── */}
+      <div style={{ position: 'absolute', top: 16, left: 16, right: 16, display: 'flex', alignItems: 'center', gap: 10, pointerEvents: 'none' }}>
+
+        {/* Back + wordmark */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 0,
+          background: 'rgba(255,255,255,0.95)', borderRadius: 9999,
+          boxShadow: '0 2px 12px rgba(47,12,51,0.12)', pointerEvents: 'auto',
+          overflow: 'hidden',
+        }}>
+          <Link href="/" style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            padding: '8px 14px', borderRight: '1px solid rgba(47,12,51,.08)',
+            color: C.purple, fontSize: 13, fontWeight: 600, textDecoration: 'none',
+            transition: 'background .15s',
+          }}
+            onMouseEnter={e => (e.currentTarget.style.background = 'rgba(47,12,51,.04)')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+          >
+            ← Home
+          </Link>
+          <span style={{ padding: '8px 16px', fontWeight: 800, fontSize: 16, letterSpacing: '-.01em' }}>
+            <span style={{ color: C.yellow }}>Nav</span><span style={{ color: C.teal }}>io</span>
+          </span>
         </div>
 
+        {/* Device selector */}
         {devices.length > 0 && (
           <select
             value={selectedDevice}
-            onChange={(e) => setSelectedDevice(e.target.value)}
-            className="bg-gray-900/90 backdrop-blur border border-gray-700 text-white text-sm rounded-xl px-3 py-2 pointer-events-auto focus:outline-none focus:border-blue-500"
+            onChange={e => setSelectedDevice(e.target.value)}
+            style={{
+              background: 'rgba(255,255,255,0.95)', border: 'none',
+              borderRadius: 9999, padding: '8px 16px',
+              fontSize: 13, fontWeight: 600, color: C.purple,
+              boxShadow: '0 2px 12px rgba(47,12,51,.12)',
+              pointerEvents: 'auto', cursor: 'pointer', outline: 'none',
+            }}
           >
-            {devices.map((d) => (
-              <option key={d} value={d}>
-                {d}
-              </option>
-            ))}
+            {devices.map(d => <option key={d} value={d}>{d}</option>)}
           </select>
         )}
 
+        {/* Online status chip */}
         {location && (
-          <div
-            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold pointer-events-auto ${
-              location.online
-                ? 'bg-green-900/80 border border-green-600 text-green-300'
-                : 'bg-gray-900/80 border border-gray-600 text-gray-400'
-            }`}
-          >
-            <div
-              className={`w-2 h-2 rounded-full ${location.online ? 'bg-green-400' : 'bg-gray-500'}`}
-            />
-            {location.online ? 'Online' : 'Offline'}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            background: 'rgba(255,255,255,0.95)',
+            borderRadius: 9999, padding: '8px 14px',
+            boxShadow: '0 2px 12px rgba(47,12,51,.12)',
+            fontSize: 12, fontWeight: 700, pointerEvents: 'auto',
+          }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', background: location.online ? C.teal : '#9ca3af', display: 'inline-block' }} />
+            <span style={{ color: location.online ? C.teal : '#9ca3af' }}>
+              {location.online ? 'Online' : 'Offline'}
+            </span>
           </div>
         )}
       </div>
 
-      {/* Bottom info card */}
-      <div className="absolute bottom-6 left-4 right-4 pointer-events-none">
-        <div className="bg-gray-900/90 backdrop-blur border border-gray-700 rounded-2xl p-4 pointer-events-auto max-w-sm mx-auto space-y-3">
+      {/* ── Bottom info card ── */}
+      <div style={{ position: 'absolute', bottom: 24, left: 16, right: 16, pointerEvents: 'none' }}>
+        <div style={{
+          background: 'rgba(255,255,255,0.97)',
+          borderRadius: 24, padding: 20,
+          boxShadow: '0 8px 32px rgba(47,12,51,0.15)',
+          maxWidth: 360, margin: '0 auto',
+          pointerEvents: 'auto',
+        }}>
           {error && !location ? (
-            <p className="text-gray-400 text-sm text-center">{error}</p>
+            <p style={{ color: '#9ca3af', fontSize: 14, textAlign: 'center' }}>{error}</p>
           ) : location ? (
             <>
-              <div className="grid grid-cols-2 gap-3">
-                <Stat label="Latitude" value={location.lat.toFixed(6)} />
-                <Stat label="Longitude" value={location.lng.toFixed(6)} />
-                <Stat label="Speed" value={`${location.speed_kmh.toFixed(1)} km/h`} />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+                <Stat label="Latitude"   value={location.lat.toFixed(6)} />
+                <Stat label="Longitude"  value={location.lng.toFixed(6)} />
+                <Stat label="Speed"      value={`${location.speed_kmh.toFixed(1)} km/h`} />
                 <Stat label="Satellites" value={String(location.satellites)} />
               </div>
               {lastSeen && (
-                <p className="text-gray-500 text-xs text-center">Updated {lastSeen}</p>
+                <p style={{ color: 'rgba(47,12,51,.35)', fontSize: 11, textAlign: 'center', marginBottom: 12 }}>
+                  Updated {lastSeen}
+                </p>
               )}
             </>
           ) : (
-            <p className="text-gray-500 text-sm text-center">Waiting for device…</p>
+            <p style={{ color: 'rgba(47,12,51,.4)', fontSize: 14, textAlign: 'center', marginBottom: 12 }}>
+              Waiting for device…
+            </p>
           )}
 
           {/* History toggle */}
-          <div className="flex items-center justify-between pt-1 border-t border-gray-700">
-            <span className="text-gray-300 text-sm">Show history trail</span>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingTop: 12, borderTop: '1px solid rgba(47,12,51,.07)' }}>
+            <span style={{ color: 'rgba(47,12,51,.6)', fontSize: 13, fontWeight: 500 }}>Show history trail</span>
             <button
-              onClick={() => setShowHistory((v) => !v)}
+              onClick={() => setShowHistory(v => !v)}
               disabled={loadingHistory}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
-                showHistory ? 'bg-blue-600' : 'bg-gray-600'
-              } ${loadingHistory ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+              style={{
+                width: 44, height: 24, borderRadius: 9999, border: 'none', cursor: loadingHistory ? 'not-allowed' : 'pointer',
+                background: showHistory ? C.teal : 'rgba(47,12,51,.15)',
+                transition: 'background .2s', position: 'relative', opacity: loadingHistory ? 0.5 : 1,
+              }}
             >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
-                  showHistory ? 'translate-x-6' : 'translate-x-1'
-                }`}
-              />
+              <span style={{
+                position: 'absolute', top: 4, left: showHistory ? 24 : 4,
+                width: 16, height: 16, borderRadius: '50%', background: C.white,
+                boxShadow: '0 1px 4px rgba(0,0,0,.2)', transition: 'left .2s',
+              }} />
             </button>
           </div>
         </div>
@@ -326,8 +304,8 @@ export default function TrackerMap() {
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div>
-      <p className="text-gray-500 text-xs">{label}</p>
-      <p className="text-white text-sm font-mono font-medium">{value}</p>
+      <p style={{ color: 'rgba(47,12,51,.35)', fontSize: 11, marginBottom: 2 }}>{label}</p>
+      <p style={{ color: C.purple, fontSize: 14, fontFamily: 'monospace', fontWeight: 700 }}>{value}</p>
     </div>
   );
 }
